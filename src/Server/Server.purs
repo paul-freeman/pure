@@ -1,27 +1,24 @@
-module Server (runServer, loadMessagesData) where
+module Server (runServer) where
 
 import Prelude
 
-import Data.Array (concatMap, findIndex, (!!), updateAt, modifyAt)
+import Data.Array (findIndex, (!!), modifyAt, insertAt, length)
 import Data.Either (Either(..))
-import Data.Maybe (Maybe(..), fromMaybe, fromJust)
+import Data.Maybe (Maybe(..))
 import Data.Nullable (toMaybe)
 import Data.String (drop, split)
 import Data.String.Pattern (Pattern(..))
 import Effect (Effect)
-import Effect.Console (log, logShow)
+import Effect.Console (log)
 import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Foreign.Object (lookup)
 import Node.Encoding (Encoding(..))
-import Node.FS.Sync (exists, readTextFile, writeTextFile)
+import Node.FS.Sync (exists, readTextFile)
 import Node.HTTP (Request, Response, listen, createServer, setHeader, setStatusMessage, requestMethod, requestHeaders, requestURL, responseAsStream, requestAsStream, setStatusCode)
-import Node.Stream (end, onDataString, onEnd, onFinish, writeString)
-import Node.URL (Query, parse)
-import Partial.Unsafe (unsafeCrashWith)
+import Node.Stream (end, onDataString, onEnd, writeString)
+import Node.URL (parse)
 import Simple.JSON (readJSON)
-import Type.Data.Boolean (kind Boolean)
-import Web.Socket.Event.MessageEvent (MessageEvent)
 
 type State =
   { messages :: Array Message}
@@ -38,23 +35,40 @@ type Route =
   , to :: String
   }
 
--- | Respond to a GET message request
-getMessage :: Request -> Response -> Ref State -> Effect Unit
-getMessage req res ref =
+-- | Parse the GET request
+parseGet :: Request -> Response -> Ref State -> Effect Unit
+parseGet req res ref =
   case lookup "user" (requestHeaders req) of
     Just userId ->
       case toMaybe $ _.query $ parse (requestURL req) of
         Just query ->
-          case split (Pattern "=") (drop 1 query) of
+          case split (Pattern "=") query of
             ["from", user] ->
               respondQuery res ref { from: user, to: userId }
-
             _ ->
               badRequest "missing 'from' key in query string" res
         Nothing ->
           badRequest "missing '?from=<user-id>' in query" res
     Nothing ->
       badRequest "missing 'user' in header data" res
+
+
+-- | Parse the POST request
+parsePost :: Request -> Either String Route
+parsePost req =
+  case lookup "user" (requestHeaders req) of
+    Just userId ->
+      case toMaybe $ _.query $ parse (requestURL req) of
+        Just query ->
+          case split (Pattern "=") query of
+            ["to", user] ->
+              Right { from: userId, to: user }
+            _ ->
+              Left "missing 'to' key in query string"
+        Nothing ->
+          Left "missing '?to=<user-id>' in query"
+    Nothing ->
+      Left "missing 'user' in header data"
 
 
 respondQuery :: Response -> Ref State -> Route -> Effect Unit
@@ -100,7 +114,21 @@ markDelivered' index state =
       { state: state { messages = newMessages }, value: newMessages!!index }
     Nothing ->
       { state: state, value: Nothing }
+
+
+-- | Add new message to the state
+addMessage :: Message -> Ref State -> Effect Unit
+addMessage msg stateRef =
+  Ref.modify_ (addMessage' msg) stateRef
   
+addMessage' :: Message -> State -> State
+addMessage' msg state =
+  case insertAt (length state.messages - 1) msg state.messages of
+    Just newMessages ->
+      state { messages = newMessages }
+    Nothing ->
+      state
+
 
 -- | Error 400 Bad Request
 badRequest :: String -> Response -> Effect Unit
@@ -119,30 +147,36 @@ respondWithError status error res = do
   setStatusMessage res error
   end out (pure unit)
 
+
+-- | Receive a new message at the server
 postMessage :: Request -> Response -> Ref.Ref State -> Effect Unit
-postMessage req res ref = do
-  msg_buf <- Ref.new ""
-  let inputMessage = requestAsStream req
-      outputStream = responseAsStream res
-      query = toMaybe $ _.query $ parse (requestURL req)
-      postData = requestAsStream req
-      handleData str = Ref.modify_ (_ <> str) msg_buf
-      handleEnd = do
-        msg <- Ref.read msg_buf
-        _ <- writeString outputStream UTF8 ("msg: " <> show msg <> "\n") (pure unit)
-        end outputStream (pure unit)
-  setHeader res "Content-Type" "text/plain"
-  setStatusCode res 200
-  _ <- writeString outputStream UTF8 ("Received POST request\n") (pure unit)
-  _ <- writeString outputStream UTF8 (show query <> "\n") (pure unit)
-  onDataString postData UTF8 handleData
-  onEnd postData handleEnd
+postMessage req res stateRef = do
+  case parsePost req of
+    Left errStr ->
+      badRequest errStr res
+    Right route -> do
+      msgRef <- Ref.new ""
+      let in_ = requestAsStream req
+          out = responseAsStream res
+          handleData str =
+            Ref.modify_ (_ <> str) msgRef
+          handleEnd = do
+            msg <- Ref.read msgRef
+            let message = { from: route.from, to: route.to, message: msg, delivered: false}
+            _ <- addMessage message stateRef
+            _ <- writeString out UTF8 (show message) (pure unit)
+            end out (pure unit)
+      setHeader res "Content-Type" "text/plain"
+      setStatusCode res 200
+      _ <- writeString out UTF8 ("Received POST request\n") (pure unit)
+      onDataString in_ UTF8 handleData
+      onEnd in_ handleEnd
 
 respondToMessage :: Request -> Response -> Ref.Ref State -> Effect Unit
 respondToMessage req res ref = do
   case requestMethod req of
     "GET" -> do
-      getMessage req res ref
+      parseGet req res ref
     "POST" -> do
       postMessage req res ref
     _ ->
@@ -156,7 +190,7 @@ respondToNonMessage req res = do
   _ <- writeString outputStream UTF8 ("bad path: " <> show path <> "\n") (pure unit)
   end outputStream (pure unit)
 
-respond :: Ref.Ref State -> Request -> Response -> Effect Unit
+respond :: Ref State -> Request -> Response -> Effect Unit
 respond ref req res = do
   case toMaybe $ _.pathname $ parse $ requestURL req of
     Just "/message" ->
@@ -164,10 +198,8 @@ respond ref req res = do
     _ ->
       respondToNonMessage req res
 
-runServer :: Effect Unit
-runServer = do
-  let host = "localhost"
-      port = 6137
+runServer :: String -> Int -> Effect Unit
+runServer host port = do
   dat <- loadMessagesData
   state <- Ref.new dat
   server <- createServer $ respond state
