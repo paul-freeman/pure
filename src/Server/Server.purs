@@ -6,7 +6,7 @@ import Data.Array (findIndex, (!!), modifyAt, insertAt, length)
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..))
 import Data.Nullable (toMaybe)
-import Data.String (drop, split)
+import Data.String (split)
 import Data.String.Pattern (Pattern(..))
 import Effect (Effect)
 import Effect.Console (log)
@@ -14,11 +14,11 @@ import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Foreign.Object (lookup)
 import Node.Encoding (Encoding(..))
-import Node.FS.Sync (exists, readTextFile)
+import Node.FS.Sync (exists, readTextFile, writeTextFile)
 import Node.HTTP (Request, Response, listen, createServer, setHeader, setStatusMessage, requestMethod, requestHeaders, requestURL, responseAsStream, requestAsStream, setStatusCode)
 import Node.Stream (end, onDataString, onEnd, writeString)
 import Node.URL (parse)
-import Simple.JSON (readJSON)
+import Simple.JSON (readJSON, writeJSON)
 
 type State =
   { messages :: Array Message}
@@ -123,7 +123,7 @@ addMessage msg stateRef =
   
 addMessage' :: Message -> State -> State
 addMessage' msg state =
-  case insertAt (length state.messages - 1) msg state.messages of
+  case insertAt (length state.messages) msg state.messages of
     Just newMessages ->
       state { messages = newMessages }
     Nothing ->
@@ -164,11 +164,11 @@ postMessage req res stateRef = do
             msg <- Ref.read msgRef
             let message = { from: route.from, to: route.to, message: msg, delivered: false}
             _ <- addMessage message stateRef
-            _ <- writeString out UTF8 (show message) (pure unit)
+            state <- Ref.read stateRef
+            _ <- saveMessageData state
             end out (pure unit)
       setHeader res "Content-Type" "text/plain"
       setStatusCode res 200
-      _ <- writeString out UTF8 ("Received POST request\n") (pure unit)
       onDataString in_ UTF8 handleData
       onEnd in_ handleEnd
 
@@ -205,9 +205,11 @@ runServer host port = do
   server <- createServer $ respond state
   listen server { hostname: host, port: port, backlog: Nothing } (pure unit)
 
+filepath :: String
+filepath = "./state.json"
+
 loadMessagesData :: Effect State
 loadMessagesData = do
-  let filepath = "./state.json"
   dataExists <- exists filepath
   if dataExists
     then do
@@ -221,18 +223,11 @@ loadMessagesData = do
     else
       pure defaultState
 
+saveMessageData :: State -> Effect Unit
+saveMessageData = writeJSON >>> writeTextFile UTF8 filepath
+
 defaultState :: State
-defaultState =
-  {
-      "messages": [
-          {
-              "from": "system1",
-              "to": "system2",
-              "message": "test",
-              "delivered": false
-          }
-      ]
-  }
+defaultState = {"messages": []}
 
 isUnread :: Route -> Message -> Boolean
 isUnread route message =
