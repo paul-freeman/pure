@@ -11,8 +11,6 @@ import Node.Encoding (Encoding(..))
 import Node.HTTP.Client (RequestHeaders(..), RequestOptions, Response, auth, headers, hostname, method, path, port, protocol, statusCode, rejectUnauthorized, request, requestAsStream, responseAsStream, statusMessage)
 import Node.Stream (Writable, end, onFinish, onDataString, onEnd, pipe, writeString)
 
-foreign import stdout :: forall r. Writable r
-
 config :: String -> String -> String -> String -> Options RequestOptions
 config method' user auth' query =
   protocol := "http:" <>
@@ -26,7 +24,7 @@ config method' user auth' query =
 
 sendMessage :: String -> String -> String -> Effect Unit
 sendMessage fromUser toUser msg = do
-  req <- request (config "POST" fromUser "" $ "?to=" <> toUser) logResponse
+  req <- request (config "POST" fromUser "" $ "?to=" <> toUser) showRes
   let body = requestAsStream req
   _ <- writeString body UTF8 msg (pure unit)
   end body (pure unit)
@@ -38,11 +36,6 @@ getMessage toUser fromUser = do
   let body = requestAsStream req
   end body (pure unit)
 
-logResponse :: Response -> Effect Unit
-logResponse response = void do
-  log "Response:"
-  let responseStream = responseAsStream response
-  pipe responseStream stdout
 
 -- | Show the server response
 showRes :: Response -> Effect Unit
