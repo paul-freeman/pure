@@ -13,9 +13,10 @@ import Data.String.Pattern (Pattern(..))
 import Effect (Effect)
 import Effect.Console (log, logShow)
 import Effect.Ref as Ref
+import Foreign.Object (lookup)
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (exists, readTextFile, writeTextFile)
-import Node.HTTP (Request, Response, listen, createServer, setHeader, requestMethod, requestURL, responseAsStream, requestAsStream, setStatusCode)
+import Node.HTTP (Request, Response, listen, createServer, setHeader, setStatusMessage, requestMethod, requestHeaders, requestURL, responseAsStream, requestAsStream, setStatusCode)
 import Node.Stream (end, onDataString, onEnd, onFinish, writeString)
 import Node.URL (Query, parse)
 import Partial.Unsafe (unsafeCrashWith)
@@ -37,22 +38,24 @@ type Route =
   , to :: String
   }
 
-parseRoute :: Maybe String -> Maybe Route
-parseRoute Nothing = Nothing
-parseRoute (Just queryString) =
-  case concatMap (split (Pattern "=")) (split (Pattern "&") $ drop 1 queryString) of
-    ["from", user1, "to", user2] -> Just { from: user1, to: user2 }
-    ["to", user2, "from", user1] -> Just { from: user1, to: user2 }
-    _ -> Nothing
-
+-- | Respond to a GET message request
 getMessage :: Request -> Response -> Ref.Ref Messages -> Effect Unit
-getMessage req res ref = do
-  let query = toMaybe $ _.query $ parse (requestURL req)
-  case parseRoute query of
-    Just route ->
-      respondQuery req res ref route
+getMessage req res ref =
+  case lookup "user" (requestHeaders req) of
+    Just userId ->
+      case toMaybe $ _.query $ parse (requestURL req) of
+        Just query ->
+          case split (Pattern "=") (drop 1 query) of
+            ["from", user] ->
+              respondQuery req res ref { from: user, to: userId }
+
+            _ ->
+              error400 "missing 'from' key in query string" res
+        Nothing ->
+          error400 "missing '?from=<user-id>' in query" res
     Nothing ->
-      respondBadQuery req res query
+      error400 "missing 'user' in header data" res
+
 
 respondQuery :: Request -> Response -> Ref.Ref Messages -> Route -> Effect Unit
 respondQuery req res ref route = do
@@ -78,14 +81,17 @@ respondQuery req res ref route = do
           _ <- Ref.write (dat { messages = newMessages }) ref
           end outputStream (pure unit)
 
-respondBadQuery :: Request -> Response -> Maybe String -> Effect Unit
-respondBadQuery req res query = do
-  let outputStream = responseAsStream res
-  setHeader res "Content-Type" "text/plain"
-  setStatusCode res 200
-  _ <- writeString outputStream UTF8 ("Received bad GET request\n") (pure unit)
-  _ <- writeString outputStream UTF8 ("   " <> show query <> "\n") (pure unit)
-  end outputStream (pure unit)
+-- | 400 Bad Request
+error400 :: String -> Response -> Effect Unit
+error400 = respondWithError 400
+
+-- | Send an error response with a specific code
+respondWithError :: Int -> String -> Response -> Effect Unit
+respondWithError status error res = do
+  let out = responseAsStream res
+  setStatusCode res status
+  setStatusMessage res error
+  end out (pure unit)
 
 postMessage :: Request -> Response -> Ref.Ref Messages -> Effect Unit
 postMessage req res ref = do
@@ -143,7 +149,6 @@ runServer = do
 
 loadMessagesData :: Effect Messages
 loadMessagesData = do
-  log "Hello!!!"
   let filepath = "./messages.json"
   dataExists <- exists filepath
   if dataExists
