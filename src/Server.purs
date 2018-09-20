@@ -2,16 +2,15 @@ module Server (runServer, loadMessagesData) where
 
 import Prelude
 
-import Control.Monad.ST as ST
-import Control.Monad.ST.Ref as STRef
-import Data.Array (concatMap, findIndex, (!!), updateAt)
+import Data.Array (concatMap, findIndex, (!!), updateAt, modifyAt)
 import Data.Either (Either(..))
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromMaybe, fromJust)
 import Data.Nullable (toMaybe)
 import Data.String (drop, split)
 import Data.String.Pattern (Pattern(..))
 import Effect (Effect)
 import Effect.Console (log, logShow)
+import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Foreign.Object (lookup)
 import Node.Encoding (Encoding(..))
@@ -22,8 +21,9 @@ import Node.URL (Query, parse)
 import Partial.Unsafe (unsafeCrashWith)
 import Simple.JSON (readJSON)
 import Type.Data.Boolean (kind Boolean)
+import Web.Socket.Event.MessageEvent (MessageEvent)
 
-type Messages =
+type State =
   { messages :: Array Message}
   
 type Message =
@@ -39,7 +39,7 @@ type Route =
   }
 
 -- | Respond to a GET message request
-getMessage :: Request -> Response -> Ref.Ref Messages -> Effect Unit
+getMessage :: Request -> Response -> Ref State -> Effect Unit
 getMessage req res ref =
   case lookup "user" (requestHeaders req) of
     Just userId ->
@@ -47,53 +47,79 @@ getMessage req res ref =
         Just query ->
           case split (Pattern "=") (drop 1 query) of
             ["from", user] ->
-              respondQuery req res ref { from: user, to: userId }
+              respondQuery res ref { from: user, to: userId }
 
             _ ->
-              error400 "missing 'from' key in query string" res
+              badRequest "missing 'from' key in query string" res
         Nothing ->
-          error400 "missing '?from=<user-id>' in query" res
+          badRequest "missing '?from=<user-id>' in query" res
     Nothing ->
-      error400 "missing 'user' in header data" res
+      badRequest "missing 'user' in header data" res
 
 
-respondQuery :: Request -> Response -> Ref.Ref Messages -> Route -> Effect Unit
-respondQuery req res ref route = do
-  let outputStream = responseAsStream res
-  setHeader res "Content-Type" "text/plain"
-  setStatusCode res 200
-  dat <- Ref.read ref
-  case findIndex (isUnread route) dat.messages of
-    Nothing -> do
-      _ <- writeString outputStream UTF8 "   (none)\n" (pure unit)
-      end outputStream (pure unit)
-    Just idx ->
-      case dat.messages!!idx of
-        Nothing -> do
-          _ <- writeString outputStream UTF8 "   (none)\n" (pure unit)
-          end outputStream (pure unit)
+respondQuery :: Response -> Ref State -> Route -> Effect Unit
+respondQuery res ref route = do
+  let body = responseAsStream res
+  eitherErrStrIndex <- lookupUnreadIndex route ref
+  case eitherErrStrIndex of
+    Right index -> do
+      setHeader res "Content-Type" "text/plain"
+      setStatusCode res 200
+      maybeMsg <- markDelivered index ref
+      case maybeMsg of
         Just msg -> do
-          _ <- writeString outputStream UTF8 (route.from <> ":\n") (pure unit)
-          _ <- writeString outputStream UTF8 ("   " <> msg.message <> "\n") (pure unit)
-          let newMessages = case updateAt idx (msg { delivered = true }) dat.messages of
-                              Nothing -> dat.messages
-                              Just m -> m
-          _ <- Ref.write (dat { messages = newMessages }) ref
-          end outputStream (pure unit)
+          _ <- writeString body UTF8 msg.message (pure unit)
+          end body (pure unit)
+        Nothing ->
+          badRequest "could not retrieve message correctly" res
+    Left errStr -> do
+      setHeader res "Content-Type" "text/plain"
+      setStatusCode res 200
+      _ <- writeString body UTF8 "(no new messages)" (pure unit)
+      end body (pure unit)
 
--- | 400 Bad Request
-error400 :: String -> Response -> Effect Unit
-error400 = respondWithError 400
+
+-- | Find an unread message for the given route
+lookupUnreadIndex :: Route -> Ref State -> Effect (Either String Int)
+lookupUnreadIndex route stateRef = do
+  state <- Ref.read stateRef
+  case findIndex (isUnread route) state.messages of
+    Nothing -> pure $ Left ("No unread messages from " <> route.from <> " to " <> route.to)
+    Just index -> pure $ Right index
+
+
+-- | Marks the indexed message as read and returns it (ignored if index out-of-bounds)
+markDelivered :: Int -> Ref State -> Effect (Maybe Message)
+markDelivered index stateRef =
+  Ref.modify' (markDelivered' index) stateRef
+
+markDelivered' :: Int -> State -> { state :: State, value :: Maybe Message }
+markDelivered' index state =
+  case modifyAt index (\msg -> msg { delivered = true }) state.messages of
+    Just newMessages ->
+      { state: state { messages = newMessages }, value: newMessages!!index }
+    Nothing ->
+      { state: state, value: Nothing }
+  
+
+-- | Error 400 Bad Request
+badRequest :: String -> Response -> Effect Unit
+badRequest = respondWithError 400
+
+-- | Error 405 Method Not Available
+methodNotAvailable :: String -> Response -> Effect Unit
+methodNotAvailable = respondWithError 405
 
 -- | Send an error response with a specific code
 respondWithError :: Int -> String -> Response -> Effect Unit
 respondWithError status error res = do
   let out = responseAsStream res
+  setHeader res "Content-Type" "text/plain"
   setStatusCode res status
   setStatusMessage res error
   end out (pure unit)
 
-postMessage :: Request -> Response -> Ref.Ref Messages -> Effect Unit
+postMessage :: Request -> Response -> Ref.Ref State -> Effect Unit
 postMessage req res ref = do
   msg_buf <- Ref.new ""
   let inputMessage = requestAsStream req
@@ -112,7 +138,7 @@ postMessage req res ref = do
   onDataString postData UTF8 handleData
   onEnd postData handleEnd
 
-respondToMessage :: Request -> Response -> Ref.Ref Messages -> Effect Unit
+respondToMessage :: Request -> Response -> Ref.Ref State -> Effect Unit
 respondToMessage req res ref = do
   case requestMethod req of
     "GET" -> do
@@ -120,7 +146,7 @@ respondToMessage req res ref = do
     "POST" -> do
       postMessage req res ref
     _ ->
-      unsafeCrashWith "Must be GET or POST method"
+      methodNotAvailable "Must be GET or POST method" res
 
 respondToNonMessage :: Request -> Response -> Effect Unit
 respondToNonMessage req res = do
@@ -130,7 +156,7 @@ respondToNonMessage req res = do
   _ <- writeString outputStream UTF8 ("bad path: " <> show path <> "\n") (pure unit)
   end outputStream (pure unit)
 
-respond :: Ref.Ref Messages -> Request -> Response -> Effect Unit
+respond :: Ref.Ref State -> Request -> Response -> Effect Unit
 respond ref req res = do
   case toMaybe $ _.pathname $ parse $ requestURL req of
     Just "/message" ->
@@ -147,24 +173,24 @@ runServer = do
   server <- createServer $ respond state
   listen server { hostname: host, port: port, backlog: Nothing } (pure unit)
 
-loadMessagesData :: Effect Messages
+loadMessagesData :: Effect State
 loadMessagesData = do
-  let filepath = "./messages.json"
+  let filepath = "./state.json"
   dataExists <- exists filepath
   if dataExists
     then do
-      dat <- readTextFile UTF8 "./messages.json"
+      dat <- readTextFile UTF8 filepath
       case readJSON dat of
         Left errors -> do
-          log "malformed JSON file - starting new log"
-          pure defaultMessages
-        Right (json :: Messages) ->
+          log "malformed JSON file - starting new state file"
+          pure defaultState
+        Right (json :: State) ->
           pure json
     else
-      pure defaultMessages
+      pure defaultState
 
-defaultMessages :: Messages
-defaultMessages =
+defaultState :: State
+defaultState =
   {
       "messages": [
           {
