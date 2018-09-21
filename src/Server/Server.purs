@@ -138,11 +138,13 @@ parseReq key req  =
       case toMaybe $ _.query $ parse (requestURL req) of
         Just query ->
           case split (Pattern "=") query of
-            [key, user] ->
-              Right $
-                if key == "from"
-                  then { from: user, to: userId }
-                  else { from: userId, to: user }
+            [key', user] ->
+              if key' == "from"
+                then Right { from: user, to: userId }
+                else
+                  if key' == "to"
+                    then Right { from: userId, to: user }
+                    else Left $ "missing '" <> key <> "' key in query string"
             _ ->
               Left $ "missing '" <> key <> "' key in query string"
         Nothing ->
