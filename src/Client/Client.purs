@@ -11,6 +11,8 @@ import Node.Encoding (Encoding(..))
 import Node.HTTP.Client (RequestHeaders(..), RequestOptions, Response, auth, headers, hostname, method, path, port, protocol, statusCode, rejectUnauthorized, request, requestAsStream, responseAsStream, statusMessage)
 import Node.Stream (end, onError, onDataString, onEnd, writeString)
 
+
+-- | Type to hold the client connection data
 type Client =
   { host :: String
   , port :: Int
@@ -19,53 +21,41 @@ type Client =
   }
 
 
--- | client posts message to user
+-- | Post a message to another user
 postTo :: Client -> String -> String -> Effect Unit
-postTo client toUser message = do
-  let options =
-        hostname := client.host <> port := client.port <> auth := client.auth
-      config =
-        makeConfig options client.user "POST" toUser
-  postMessage config message
+postTo client toUser message = postMessage (makeConfig client "POST" toUser) message
+  where
+    postMessage config msg = do
+      req <- request config showRes
+      let body = requestAsStream req
+      onError body $ showErr "error sending POST request to server"
+      _ <- writeString body UTF8 msg (pure unit)
+      end body (pure unit) 
 
--- | client gets message from user
+-- | Get a message from another user
 getFrom :: Client -> String -> Effect Unit
-getFrom client fromUser = do
-  let options =
-        hostname := client.host <> port := client.port <> auth := client.auth
-      config =
-        makeConfig options client.user "GET" fromUser
-  getMessage config
+getFrom client fromUser = getMessage (makeConfig client "GET" fromUser)
+  where
+    getMessage config = do
+      req <- request config showRes
+      let body = requestAsStream req
+      onError body $ showErr "error sending GET request to server"
+      end body (pure unit)
+    
 
-
--- | add standard options to request config
-makeConfig :: Options RequestOptions -> String -> String -> String -> Options RequestOptions
-makeConfig options client method_ user =
-  let query = (if method_ == "GET" then "from=" else "to=") <> user in
-  options <>
+-- | make RequestOptions for HTTP request
+makeConfig :: Client -> String -> String -> Options RequestOptions
+makeConfig client method_ user =
+  hostname := client.host <>
+  port := client.port <>
+  auth := client.auth <>
   protocol := "http:" <>
   method := method_ <>
   path := ("/message?" <> query) <>
   rejectUnauthorized := false <>
-  headers := (RequestHeaders (singleton "user" client))
-
-
--- | make the POST request
-postMessage :: Options RequestOptions -> String -> Effect Unit
-postMessage config msg = do
-  req <- request config showRes
-  let body = requestAsStream req
-  onError body $ showErr "error sending POST request to server"
-  _ <- writeString body UTF8 msg (pure unit)
-  end body (pure unit)
-
--- | make the GET request
-getMessage :: Options RequestOptions -> Effect Unit
-getMessage config = do
-  req <- request config showRes
-  let body = requestAsStream req
-  onError body $ showErr "error sending GET request to server"
-  end body (pure unit)
+  headers := (RequestHeaders (singleton "user" client.user))
+    where
+      query = (if method_ == "GET" then "from=" else "to=") <> user
 
 
 -- | Show the server response
@@ -83,5 +73,7 @@ showRes res = do
     code ->
       log $ (show code) <> " Unhandled Error\n" <> (statusMessage res)
 
+
+-- | Show errors
 showErr :: String -> Error -> Effect Unit
 showErr errStr error = log $ (show error) <> "\n" <> errStr
