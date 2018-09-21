@@ -163,8 +163,8 @@ lookupUnreadIndex route stateRef = do
     Nothing -> pure $ Left ("No unread messages from " <> route.from <> " to " <> route.to)
     Just index -> pure $ Right index
       where
-        isUnread route message =
-          (route.from == message.from) && (route.to == message.to) && (not message.delivered)
+        isUnread route' message =
+          (route'.from == message.from) && (route'.to == message.to) && (not message.delivered)
 
 -- | Marks the indexed message as read and returns it (ignored if index out-of-bounds)
 markDelivered :: Int -> Ref State -> Effect (Maybe Message)
